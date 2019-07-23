@@ -1,0 +1,27 @@
+livenessProbe:
+  initialDelaySeconds: 60
+  periodSeconds: 30
+  sonarWebContext: /
+persistence:
+  enabled: true
+  existingClaim: new-sonar
+postgresql:
+  enabled: false
+  postgresDatabase: sonar
+  postgresPassword: nVS4jfkd
+  postgresServer: investree-management.pgsql.ap-southeast-5.rds.aliyuncs.com
+  postgresUser: superadmin
+  service:
+    port: 3433
+readinessProbe:
+  failureThreshold: 6
+  initialDelaySeconds: 60
+  periodSeconds: 30
+  sonarWebContext: /
+securityContext:
+  fsGroup: 999
+service:
+  externalPort: 9999
+  internalPort: 9000
+  name: sonarqube
+  type: ClusterIP
