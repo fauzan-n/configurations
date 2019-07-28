@@ -1,0 +1,349 @@
+def slave = "dynamic-slave"
+podTemplate(
+  label: slave,
+  containers:[
+  containerTemplate(
+    name: "java-node",
+    image: "registry-intl-vpc.ap-southeast-5.aliyuncs.com/investree/java-node",
+    command: "cat",
+    ttyEnabled: "true"),
+    containerTemplate(
+      name: "docker",
+      image: "docker",
+      command: "cat",
+      ttyEnabled: "true"),
+    containerTemplate(
+      name: "kubectl",
+      image: "gcr.io/cloud-builders/kubectl",
+      command: "cat",
+      ttyEnabled: "true")],
+  volumes:[
+    hostPathVolume(
+      hostPath: "/var/run/docker.sock",
+      mountPath: "/var/run/docker.sock"),
+    persistentVolumeClaim(
+      mountPath: "/root",
+      claimName: "slave-root-home",
+      readOnly: "false")
+  ]
+){
+  node(slave){
+    MS_NAME = "fe-frontoffice"
+    SLACK_CHANNEL = "jenkins-notifications"
+    MS_NAMESPACE = "default"
+    DOCKERFILE_PATH = "/jenkins-home/dockerfiles/frontend-template"
+    DOCKERFILE = "dockerfile-template"
+    DEPLOYMENT_PATH = "/jenkins-home/kubernetes-manifests/deployment/frontend-template.yaml"
+    DEPLOYMENT = "deployment-template.yaml"
+    NGINXCONF_PATH = "/jenkins-home/nginx/default.conf"
+    NGINXCONF = "default.conf"
+    ENV_PATH = "/jenkins-home/environments/investree"
+    ENV = ".env"
+    DEV_SET_REPLICA = "2"
+    STG_SET_REPLICA = "2"
+    PRD_SET_REPLICA = "3"
+    DOCKER_REGISTRY = "registry-intl-vpc.ap-southeast-5.aliyuncs.com"
+    JENKINS_HOME = "jenkins/jenkins-home"
+    ALI_REG_CRED_ID = "k8s-deployer"
+    DEV_LOAN_ORIGINATION_BRANCH = "origin/dev-loan-origination"
+    DEV_ON_BOARDING_BRANCH = "origin/dev-on-boarding"
+    DEV_BRANCH = "origin/develop"
+    STG_BRANCH = "origin/staging"
+    MST_BRANCH = "origin/master"
+    CR_DEV_NAMESPACE = "invstr-devel"
+    CR_STG_NAMESPACE = "invstr-staging"
+    CR_MST_NAMESPACE = "invstr-master"
+    DEV_LOAN_ORIGINATION_DOCKER_IMAGE = "${DOCKER_REGISTRY}/${CR_DEV_NAMESPACE}/dev-loan-origination-${MS_NAME}"
+    DEV_ON_BOARDING_DOCKER_IMAGE = "${DOCKER_REGISTRY}/${CR_DEV_NAMESPACE}/dev-on-boarding-${MS_NAME}"
+    DEV_DOCKER_IMAGE = "${DOCKER_REGISTRY}/${CR_DEV_NAMESPACE}/${MS_NAME}"
+    STG_DOCKER_IMAGE = "${DOCKER_REGISTRY}/${CR_STG_NAMESPACE}/${MS_NAME}"
+    MST_DOCKER_IMAGE = "${DOCKER_REGISTRY}/${CR_MST_NAMESPACE}/${MS_NAME}"
+    ALI_KUBECTL_DEV_CRED_ID = "devel-kubernetes"
+    ALI_KUBECTL_STG_CRED_ID = "staging-kubernetes"
+    ALI_KUBECTL_PRD_CRED_ID = "production-kubernetes"
+    ALI_KUBE_DEV_SERVER_URL = "https://10.5.1.194:6443"
+    ALI_KUBE_STG_SERVER_URL = "https://10.7.1.227:6443"
+    ALI_KUBE_PRD_SERVER_URL = "https://10.0.0.127:6443"
+    DEV_LOAN_ORIGINATION_DEPLOYMENT = "dev-loan-origination-${MS_NAME}"
+    DEV_ON_BOARDING_DEPLOYMENT = "dev-on-boarding-${MS_NAME}"
+    DEV_DEPLOYMENT = "dev-${MS_NAME}"
+    STG_DEPLOYMENT = "stg-${MS_NAME}"
+    PRD_DEPLOYMENT = "prd-${MS_NAME}"
+    PRD_API_BASE_URL = "svc.investree.id"
+    DEV_API_BASE_URL = "dev-${PRD_API_BASE_URL}"
+    STG_API_BASE_URL = "stg-${PRD_API_BASE_URL}"
+    PRD_HOST = "fo.investree.id"
+    DEV_LOAN_ORIGINATION_HOST = "loan-origination-${PRD_HOST}"
+    DEV_ON_BOARDING_HOST = "on-boarding-${PRD_HOST}"
+    DEV_HOST = "devel-${PRD_HOST}"
+    STG_HOST = "staging-${PRD_HOST}"
+
+    try{
+      slackSend(channel: "#${SLACK_CHANNEL}", color: "good", message: "${MS_NAME} pipeline has been started \n${env.BUILD_URL}")
+      stage("Pull Source Code"){
+        scmVars = checkout([
+          $class: "GitSCM",
+          branches: scm.branches,
+          userRemoteConfigs: scm.userRemoteConfigs
+        ])
+        GIT_BRANCH = scmVars.GIT_BRANCH
+        echo "REPOSITORY BRANCH : ${GIT_BRANCH}"
+        def packageJSON = readJSON file: "package.json"
+        def version = packageJSON.version
+        MS_VERSION = "${version}.${env.BUILD_NUMBER}"
+      }
+
+      stage("Inject Files"){
+        container("kubectl"){
+          sh "kubectl cp ${JENKINS_HOME}:${DOCKERFILE_PATH} ${DOCKERFILE}"
+          sh "kubectl cp ${JENKINS_HOME}:${DEPLOYMENT_PATH} ${DEPLOYMENT}"
+          sh "kubectl cp ${JENKINS_HOME}:${NGINXCONF_PATH} ${NGINXCONF}"
+          sh "kubectl cp ${JENKINS_HOME}:${ENV_PATH} ${ENV}"
+          if (GIT_BRANCH == "${DEV_LOAN_ORIGINATION_BRANCH}" || GIT_BRANCH == "${DEV_ON_BOARDING_BRANCH}" || GIT_BRANCH == "${DEV_BRANCH}"){
+            sh "sed -i -e 's/API_BASE_URL/${DEV_API_BASE_URL}/' ${ENV}"
+          } else if (GIT_BRANCH == "${STG_BRANCH}") {
+            sh "sed -i -e 's/API_BASE_URL/${STG_API_BASE_URL}/' ${ENV}"
+          } else {
+            sh "sed -i -e 's/API_BASE_URL/${PRD_API_BASE_URL}/' ${ENV}"
+          }
+        }
+      }
+
+      stage("Analyse and Build Code"){
+        container("java-node"){
+          def scannerHome = tool "sonarqube-scanner"
+          withSonarQubeEnv("sonar-investree"){
+            sh "${scannerHome}/bin/sonar-scanner -Dsonar.projectKey=${MS_NAME}"
+          }
+        }
+        timeout(time: 15, unit: "MINUTES"){
+          def qg = waitForQualityGate()
+          if (qg.status != "OK"){
+            slackSend channel: "#${SLACK_CHANNEL}", color: "danger", message: "Source code doesn't pass the quality gate"
+            slackSend channel: "#${SLACK_CHANNEL}", color: "danger", message: "https://sonar.investree.id:9999/dashboard?id=${MS_NAME}"
+            currentBuild.result = "ABORTED"
+            error ("Source code doesn't pass the quality gate")
+          }
+        }
+      }
+
+      if (GIT_BRANCH == "${DEV_LOAN_ORIGINATION_BRANCH}"){
+        stage("Build and Push Docker Image"){
+          container("docker"){
+            withDockerRegistry([
+              credentialsId: "${ALI_REG_CRED_ID}",
+              url: "https://${DOCKER_REGISTRY}"
+            ]){
+              sh "docker build --rm -t ${DEV_LOAN_ORIGINATION_DOCKER_IMAGE}:${MS_VERSION} -f ${DOCKERFILE} --no-cache ."
+              sh "docker push ${DEV_LOAN_ORIGINATION_DOCKER_IMAGE}:${MS_VERSION}"
+              sh "docker images -a ${DEV_LOAN_ORIGINATION_DOCKER_IMAGE}:${MS_VERSION} -q"
+              sh "docker rmi -f \$(docker images -a ${DEV_LOAN_ORIGINATION_DOCKER_IMAGE}:${MS_VERSION} -q)"
+            }
+          }
+        }
+
+        stage("Deploy ${DEV_LOAN_ORIGINATION_BRANCH} to Development"){
+          container("kubectl"){
+            withKubeConfig([
+              credentialsId:"${ALI_KUBECTL_DEV_CRED_ID}",
+              serverUrl:"${ALI_KUBE_DEV_SERVER_URL}"
+            ]){
+              LIST_DEPLOYMENT = sh(script: "kubectl get deployment -n ${MS_NAMESPACE} | grep \"${DEV_LOAN_ORIGINATION_DEPLOYMENT}\" | wc -l", returnStdout: true).trim()
+              if (LIST_DEPLOYMENT == "1"){
+                sh "kubectl set image -n ${MS_NAMESPACE} deployment/${DEV_LOAN_ORIGINATION_DEPLOYMENT} ${DEV_LOAN_ORIGINATION_DEPLOYMENT}=${DEV_LOAN_ORIGINATION_DOCKER_IMAGE}:${MS_VERSION}"
+                slackSend channel: "#${SLACK_CHANNEL}", color: "good", message: "${MS_NAME} on development has been updated to version ${MS_VERSION}"
+              }
+              else{
+                sh "sed -i -e 's/CR_NAMESPACE/${CR_DEV_NAMESPACE}/' ${DEPLOYMENT}"
+                sh "sed -i -e 's/SET_REPLICA/${DEV_SET_REPLICA}/' ${DEPLOYMENT}"
+                sh "sed -i -e 's/DEPLOYMENT/${DEV_LOAN_ORIGINATION_DEPLOYMENT}/' ${DEPLOYMENT}"
+                sh "sed -i -e 's/MS_NAMESPACE/${MS_NAMESPACE}/' ${DEPLOYMENT}"
+                sh "sed -i -e 's/MS_VERSION/${MS_VERSION}/' ${DEPLOYMENT}"
+                sh "sed -i -e 's/MS_NAME/dev-loan-origination-${MS_NAME}/' ${DEPLOYMENT}"
+                sh "kubectl create -f ${DEPLOYMENT}"
+                slackSend channel: "#${SLACK_CHANNEL}", color: "good", message: "dev-loan-origination-${MS_NAME}-${MS_VERSION} has been deployed to development"
+              }
+              slackSend channel: "#${SLACK_CHANNEL}", color: "good", message: "https://${DEV_LOAN_ORIGINATION_HOST}"
+            }
+          }
+        }
+      }
+
+      if (GIT_BRANCH == "${DEV_ON_BOARDING_BRANCH}"){
+        stage("Build and Push Docker Image"){
+          container("docker"){
+            withDockerRegistry([
+              credentialsId: "${ALI_REG_CRED_ID}",
+              url: "https://${DOCKER_REGISTRY}"
+            ]){
+              sh "docker build --rm -t ${DEV_ON_BOARDING_DOCKER_IMAGE}:${MS_VERSION} -f ${DOCKERFILE} --no-cache ."
+              sh "docker push ${DEV_ON_BOARDING_DOCKER_IMAGE}:${MS_VERSION}"
+              sh "docker images -a ${DEV_ON_BOARDING_DOCKER_IMAGE}:${MS_VERSION} -q"
+              sh "docker rmi -f \$(docker images -a ${DEV_ON_BOARDING_DOCKER_IMAGE}:${MS_VERSION} -q)"
+            }
+          }
+        }
+
+        stage("Deploy ${DEV_ON_BOARDING_BRANCH} to Development"){
+          container("kubectl"){
+            withKubeConfig([
+              credentialsId:"${ALI_KUBECTL_DEV_CRED_ID}",
+              serverUrl:"${ALI_KUBE_DEV_SERVER_URL}"
+            ]){
+              LIST_DEPLOYMENT = sh(script: "kubectl get deployment -n ${MS_NAMESPACE} | grep \"${DEV_ON_BOARDING_DEPLOYMENT}\" | wc -l", returnStdout: true).trim()
+              if (LIST_DEPLOYMENT == "1"){
+                sh "kubectl set image -n ${MS_NAMESPACE} deployment/${DEV_ON_BOARDING_DEPLOYMENT} ${DEV_ON_BOARDING_DEPLOYMENT}=${DEV_ON_BOARDING_DOCKER_IMAGE}:${MS_VERSION}"
+                slackSend channel: "#${SLACK_CHANNEL}", color: "good", message: "${MS_NAME} on development has been updated to version ${MS_VERSION}"
+              }
+              else{
+                sh "sed -i -e 's/CR_NAMESPACE/${CR_DEV_NAMESPACE}/' ${DEPLOYMENT}"
+                sh "sed -i -e 's/SET_REPLICA/${DEV_SET_REPLICA}/' ${DEPLOYMENT}"
+                sh "sed -i -e 's/DEPLOYMENT/${DEV_ON_BOARDING_DEPLOYMENT}/' ${DEPLOYMENT}"
+                sh "sed -i -e 's/MS_NAMESPACE/${MS_NAMESPACE}/' ${DEPLOYMENT}"
+                sh "sed -i -e 's/MS_VERSION/${MS_VERSION}/' ${DEPLOYMENT}"
+                sh "sed -i -e 's/MS_NAME/dev-on-boarding-${MS_NAME}/' ${DEPLOYMENT}"
+                sh "kubectl create -f ${DEPLOYMENT}"
+                slackSend channel: "#${SLACK_CHANNEL}", color: "good", message: "dev-on-boarding-${MS_NAME}-${MS_VERSION} has been deployed to development"
+              }
+              slackSend channel: "#${SLACK_CHANNEL}", color: "good", message: "https://${DEV_ON_BOARDING_HOST}"
+            }
+          }
+        }
+      }
+
+      if (GIT_BRANCH == "${DEV_BRANCH}"){
+        stage("Build and Push Docker Image"){
+          container("docker"){
+            withDockerRegistry([
+              credentialsId: "${ALI_REG_CRED_ID}",
+              url: "https://${DOCKER_REGISTRY}"
+            ]){
+              sh "docker build --rm -t ${DEV_DOCKER_IMAGE}:${MS_VERSION} -f ${DOCKERFILE} --no-cache ."
+              sh "docker push ${DEV_DOCKER_IMAGE}:${MS_VERSION}"
+              sh "docker images -a ${DEV_DOCKER_IMAGE}:${MS_VERSION} -q"
+              sh "docker rmi -f \$(docker images -a ${DEV_DOCKER_IMAGE}:${MS_VERSION} -q)"
+            }
+          }
+        }
+
+        stage("Deploy to Development"){
+          container("kubectl"){
+            withKubeConfig([
+              credentialsId:"${ALI_KUBECTL_DEV_CRED_ID}",
+              serverUrl:"${ALI_KUBE_DEV_SERVER_URL}"
+            ]){
+              LIST_DEPLOYMENT = sh(script: "kubectl get deployment -n ${MS_NAMESPACE} | grep \"${DEV_DEPLOYMENT}\" | wc -l", returnStdout: true).trim()
+              if (LIST_DEPLOYMENT == "1"){
+                sh "kubectl set image -n ${MS_NAMESPACE} deployment/${DEV_DEPLOYMENT} ${DEV_DEPLOYMENT}=${DEV_DOCKER_IMAGE}:${MS_VERSION}"
+                slackSend channel: "#${SLACK_CHANNEL}", color: "good", message: "${MS_NAME} on development has been updated to version ${MS_VERSION}"
+              }
+              else{
+                sh "sed -i -e 's/CR_NAMESPACE/${CR_DEV_NAMESPACE}/' ${DEPLOYMENT}"
+                sh "sed -i -e 's/SET_REPLICA/${DEV_SET_REPLICA}/' ${DEPLOYMENT}"
+                sh "sed -i -e 's/DEPLOYMENT/${DEV_DEPLOYMENT}/' ${DEPLOYMENT}"
+                sh "sed -i -e 's/MS_NAMESPACE/${MS_NAMESPACE}/' ${DEPLOYMENT}"
+                sh "sed -i -e 's/MS_VERSION/${MS_VERSION}/' ${DEPLOYMENT}"
+                sh "sed -i -e 's/MS_NAME/${MS_NAME}/' ${DEPLOYMENT}"
+                sh "kubectl create -f ${DEPLOYMENT}"
+                slackSend channel: "#${SLACK_CHANNEL}", color: "good", message: "${MS_NAME}-${MS_VERSION} has been deployed to development"
+              }
+              slackSend channel: "#${SLACK_CHANNEL}", color: "good", message: "https://${DEV_HOST}"
+            }
+          }
+        }
+      }
+
+      if (GIT_BRANCH == "${STG_BRANCH}"){
+        stage("Build and Push Docker Image"){
+          container("docker"){
+            withDockerRegistry([
+              credentialsId: "${ALI_REG_CRED_ID}",
+              url: "https://${DOCKER_REGISTRY}"
+            ]){
+              sh "docker build --rm -t ${STG_DOCKER_IMAGE}:${MS_VERSION} -f ${DOCKERFILE} --no-cache ."
+              sh "docker push ${STG_DOCKER_IMAGE}:${MS_VERSION}"
+              sh "docker images -a ${STG_DOCKER_IMAGE}:${MS_VERSION} -q"
+              sh "docker rmi -f \$(docker images -a ${STG_DOCKER_IMAGE}:${MS_VERSION} -q)"
+            }
+          }
+        }
+
+        stage("Deploy to Staging"){
+          container("kubectl"){
+            withKubeConfig([
+              credentialsId:"${ALI_KUBECTL_STG_CRED_ID}",
+              serverUrl:"${ALI_KUBE_STG_SERVER_URL}"
+            ]){
+              LIST_DEPLOYMENT = sh(script: "kubectl get deployment -n ${MS_NAMESPACE} | grep \"${STG_DEPLOYMENT}\" | wc -l", returnStdout: true).trim()
+              if (LIST_DEPLOYMENT == "1"){
+                sh "kubectl set image -n ${MS_NAMESPACE} deployment/${STG_DEPLOYMENT} ${STG_DEPLOYMENT}=${STG_DOCKER_IMAGE}:${MS_VERSION}"
+                slackSend channel: "#${SLACK_CHANNEL}", color: "good", message: "${MS_NAME} on staging has been updated to version ${MS_VERSION}"
+              }
+              else{
+                sh "sed -i -e 's/CR_NAMESPACE/${CR_STG_NAMESPACE}/' ${DEPLOYMENT}"
+                sh "sed -i -e 's/SET_REPLICA/${STG_SET_REPLICA}/' ${DEPLOYMENT}"
+                sh "sed -i -e 's/DEPLOYMENT/${STG_DEPLOYMENT}/' ${DEPLOYMENT}"
+                sh "sed -i -e 's/MS_NAMESPACE/${MS_NAMESPACE}/' ${DEPLOYMENT}"
+                sh "sed -i -e 's/MS_VERSION/${MS_VERSION}/' ${DEPLOYMENT}"
+                sh "sed -i -e 's/MS_NAME/${MS_NAME}/' ${DEPLOYMENT}"
+                sh "kubectl create -f ${DEPLOYMENT}"
+                slackSend channel: "#${SLACK_CHANNEL}", color: "good", message: "${MS_NAME}-${MS_VERSION} has been deployed to staging"
+              }
+              slackSend channel: "#${SLACK_CHANNEL}", color: "good", message: "https://${STG_HOST}"
+            }
+          }
+        }
+      }
+
+      else if (GIT_BRANCH == "${MST_BRANCH}"){
+        stage("Build and Push Docker Image"){
+          container("docker"){
+            withDockerRegistry([
+              credentialsId: "${ALI_REG_CRED_ID}",
+              url: "https://${DOCKER_REGISTRY}"
+            ]){
+              sh "docker build --rm -t ${MST_DOCKER_IMAGE}:${MS_VERSION} -f ${DOCKERFILE} --no-cache ."
+              sh "docker push ${MST_DOCKER_IMAGE}:${MS_VERSION}"
+              sh "docker images -a ${MST_DOCKER_IMAGE}:${MS_VERSION} -q"
+              sh "docker rmi -f \$(docker images -a ${MST_DOCKER_IMAGE}:${MS_VERSION} -q)"
+            }
+          }
+        }
+
+        stage("Deploy to Production"){
+          container("kubectl"){
+            slackSend channel: "#${SLACK_CHANNEL}", color: "good", message: "Deploy ${MS_NAME}-${MS_VERSION} to Production?"
+            def confirmDialog = "Deploy ${MS_NAME}-${MS_VERSION} to Production?"
+            releaseApprover = input message: confirmDialog,submitterParameter: "releaseApprover"
+            echo "${releaseApprover} ${MS_NAME}-${MS_VERSION} to Production"
+            withKubeConfig([
+              credentialsId:"${ALI_KUBECTL_PRD_CRED_ID}",
+              serverUrl:"${ALI_KUBE_PRD_SERVER_URL}"
+            ]){
+              LIST_DEPLOYMENT = sh(script: "kubectl get deployment -n ${MS_NAMESPACE} | grep \"${PRD_DEPLOYMENT}\" | wc -l", returnStdout: true).trim()
+              if (LIST_DEPLOYMENT == "1"){
+                sh "kubectl set image -n ${MS_NAMESPACE} deployment/${PRD_DEPLOYMENT} ${PRD_DEPLOYMENT}=${MST_DOCKER_IMAGE}:${MS_VERSION}"
+                slackSend channel: "#${SLACK_CHANNEL}", color: "good", message: "${MS_NAME} on production has been updated to version ${MS_VERSION}"
+              }
+              else{
+                sh "sed -i -e 's/CR_NAMESPACE/${CR_MST_NAMESPACE}/' ${DEPLOYMENT}"
+                sh "sed -i -e 's/SET_REPLICA/${PRD_SET_REPLICA}/' ${DEPLOYMENT}"
+                sh "sed -i -e 's/DEPLOYMENT/${PRD_DEPLOYMENT}/' ${DEPLOYMENT}"
+                sh "sed -i -e 's/MS_NAMESPACE/${MS_NAMESPACE}/' ${DEPLOYMENT}"
+                sh "sed -i -e 's/MS_VERSION/${MS_VERSION}/' ${DEPLOYMENT}"
+                sh "sed -i -e 's/MS_NAME/${MS_NAME}/' ${DEPLOYMENT}"
+                sh "kubectl create -f ${DEPLOYMENT}"
+                slackSend channel: "#${SLACK_CHANNEL}", color: "good", message: "${MS_NAME}-${MS_VERSION} has been deployed to production"
+              }
+              slackSend channel: "#${SLACK_CHANNEL}", color: "good", message: "https://${PRD_HOST}"
+            }
+          }
+        }
+      }
+    }
+    catch (e) {
+      slackSend channel: "#${SLACK_CHANNEL}", color: "danger", message: "${MS_NAME} pipeline build ${currentBuild.number} failed"
+      throw e
+    }
+  }
+}
